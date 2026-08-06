@@ -1,0 +1,13 @@
+{
+  "full_name": "Jane Doe",
+  "email": "jane.doe@example.com",
+  "phone": "+1-555-000-0000",
+  "location": "San Francisco, CA",
+  "linkedin_url": "https://linkedin.com/in/janedoe",
+  "github_url": "https://github.com/janedoe",
+  "portfolio_url": "",
+  "resume_path": "config/resume.pdf",
+  "cover_letter_template": "I'm excited about {company}'s work on {role_context} and believe my background in {relevant_skill} makes me a strong fit for the {role} role.",
+  "work_authorization": "Authorized to work in the US without sponsorship",
+  "years_of_experience": 3
+}

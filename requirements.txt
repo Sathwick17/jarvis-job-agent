@@ -1,2 +1,3 @@
 browser-use==0.13.7
 playwright==1.62.0
+litellm>=1.95.0

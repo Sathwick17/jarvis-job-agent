@@ -62,6 +62,8 @@ This project is under active development. Nothing is wired up yet — see the ro
 
 Setup instructions will land here once the core pipeline works end-to-end. The goal is a self-hostable stack anyone can run with their own resume, job list, and Gmail account — no shared credentials, no hosted service.
 
+**Codex will review your output once your are done**
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

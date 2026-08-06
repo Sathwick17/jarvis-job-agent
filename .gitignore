@@ -1,5 +1,12 @@
+# macOS
+.DS_Store
+
 # Local reference material, not for the public repo
 entire chat
+
+# Personal applicant data — never committed, each user supplies their own
+config/profile.json
+config/*.pdf
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
