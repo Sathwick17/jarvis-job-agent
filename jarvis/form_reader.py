@@ -53,6 +53,15 @@ async def read_form_fields(page: Page) -> list[FormField]:
             if "search" in element_id.lower() or input_type == "search":
                 continue
 
+            # Invisible reCAPTCHA (v3/badge) leaves a hidden textarea in the
+            # DOM on nearly every Greenhouse form even when there's no
+            # actual visible challenge — it's not a field to fill or a
+            # blocker, just background scoring. A genuinely visible CAPTCHA
+            # challenge (v2 checkbox/image grid) would show up as a real,
+            # visible field and should still be caught downstream.
+            if "captcha" in element_id.lower() and not await el.is_visible():
+                continue
+
             label = await _label_for(page, element_id)
             required = "*" in label or bool(await el.get_attribute("required"))
 
