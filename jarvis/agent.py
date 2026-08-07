@@ -118,6 +118,28 @@ async def run(url: str) -> None:
             status = "OK" if r.ok else "FLAGGED"
             print(f"  [{status}] {r.label!r}: {r.detail}")
 
+        # Greenhouse (and likely other ATSs) conditionally reveal new
+        # fields after a combobox is answered — e.g. "Please identify
+        # your race" only appears in the DOM once "Are you Hispanic/
+        # Latino?" has been answered. A real run confirmed this: race
+        # was simply absent at the initial read, not a matching failure.
+        # Re-scan once for anything that appeared as a side effect of
+        # filling and fold it into the same matched/unmatched flow.
+        known_ids = {f.element_id for f in fields}
+        fields_after_fill = await read_form_fields(page)
+        newly_revealed = [f for f in fields_after_fill if f.element_id not in known_ids]
+        if newly_revealed:
+            print(f"\n{len(newly_revealed)} new field(s) appeared after filling "
+                  f"(conditionally revealed): {[f.label for f in newly_revealed]}")
+            new_matched, new_unmatched = match_fields(newly_revealed, profile)
+            if new_matched:
+                new_fill_results = await fill_matched_fields(page, new_matched)
+                for r in new_fill_results:
+                    status = "OK" if r.ok else "FLAGGED"
+                    print(f"  [{status}] {r.label!r}: {r.detail}")
+            matched += new_matched
+            unmatched += new_unmatched
+
         # File inputs (e.g. an optional cover-letter upload we have no file
         # for) are never something the LLM can "answer" with text — a real
         # run tried exactly this and Playwright correctly rejected it

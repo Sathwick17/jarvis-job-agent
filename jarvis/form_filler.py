@@ -68,6 +68,26 @@ def _find_matching_option(answer: str, option_texts: list[str]) -> int | None:
         if re.search(rf"\b{re.escape(option_lower)}\b", answer_lower):
             return i
 
+    # Last resort: word-overlap. Handles cases like a stored profile value
+    # of "Not a protected veteran" against a real option worded "I am not
+    # a protected veteran" — different phrasing, same meaning, most content
+    # words shared. Require most of the answer's words to appear in the
+    # option (not the other way around) so a short generic option like
+    # "No" doesn't win by accident against an unrelated longer answer.
+    _STOPWORDS = {"a", "an", "the", "i", "am", "is", "are", "to", "of", "or", "and"}
+    answer_words = {w for w in re.findall(r"[a-z0-9']+", answer_lower) if w not in _STOPWORDS}
+    if answer_words:
+        best_index, best_overlap = None, 0.0
+        for i, t in enumerate(option_texts):
+            option_words = {w for w in re.findall(r"[a-z0-9']+", t.strip().lower()) if w not in _STOPWORDS}
+            if not option_words:
+                continue
+            overlap = len(answer_words & option_words) / len(answer_words)
+            if overlap > best_overlap:
+                best_index, best_overlap = i, overlap
+        if best_index is not None and best_overlap >= 0.6:
+            return best_index
+
     return None
 
 
