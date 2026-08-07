@@ -8,25 +8,52 @@ field rather than once per navigation step, which is what made the old
 full-agent-loop approach slow and prone to losing track of the task.
 """
 
+import re
+
 from browser_use.llm.litellm.chat import ChatLiteLLM
 from browser_use.llm.messages import SystemMessage, UserMessage
 
 from jarvis.field_matcher import UnmatchedField
 
 _SYSTEM_PROMPT = """You are helping fill out a real job application form on behalf of a real \
-applicant. You will be given one form field's label and the applicant's background. Respond \
-with ONLY the text that should go in that field — no preamble, no quotation marks, no \
-explanation. Keep it brief and directly responsive to what the field is actually asking. \
-If the field expects a short factual answer (e.g. yes/no, a date, a number), give exactly \
-that, nothing more."""
+applicant. You will be given one form field's label and only the applicant background that is \
+actually relevant to it. Respond with ONLY the text that should go in that field — no \
+preamble, no quotation marks, no explanation. Keep it brief and directly responsive to what \
+the field is actually asking. If the field expects a short factual answer (e.g. yes/no, a \
+date, a number), give exactly that, nothing more. If no background was given because nothing \
+relevant applies, give a brief, reasonable, generic answer rather than inventing specifics."""
+
+# Rather than hand every question the applicant's entire profile and trust
+# the model to ignore what's irrelevant (tested and failed — it answered a
+# scheduling question with immigration status because that fact was simply
+# present in the prompt), only include background that keyword-matches
+# what the question is actually about. Same principle as field_matcher:
+# decide relevance in code, don't rely on the LLM to self-filter.
+_RELEVANCE_PATTERNS: list[tuple[re.Pattern, list[str]]] = [
+    (re.compile(r"visa|sponsor|authoriz|work\s*permit|citizen", re.IGNORECASE),
+     ["work_authorization", "sponsorship_required"]),
+    (re.compile(r"experience|years|background|qualif", re.IGNORECASE),
+     ["years_of_experience"]),
+    (re.compile(r"why|interest|motivat|passion", re.IGNORECASE),
+     ["years_of_experience"]),
+]
+
+
+def _relevant_background(field_label: str, profile: dict) -> dict:
+    background = {}
+    for pattern, keys in _RELEVANCE_PATTERNS:
+        if pattern.search(field_label):
+            for key in keys:
+                if profile.get(key):
+                    background[key] = profile[key]
+    return background
 
 
 def build_question_prompt(field_label: str, profile: dict, job_context: str = "") -> str:
-    return f"""Applicant background:
-- Name: {profile.get('full_name', '')}
-- Years of experience: {profile.get('years_of_experience', '')}
-- Work authorization: {profile.get('work_authorization', '')}
-- Sponsorship: {profile.get('sponsorship_required', '')}
+    background = _relevant_background(field_label, profile)
+    background_lines = "\n".join(f"- {k.replace('_', ' ').title()}: {v}" for k, v in background.items())
+
+    return f"""{f"Relevant applicant background:\n{background_lines}" if background_lines else "No specific applicant background applies to this field."}
 {f"Job context: {job_context}" if job_context else ""}
 
 Form field label: {field_label!r}

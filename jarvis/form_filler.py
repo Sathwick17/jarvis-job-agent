@@ -14,6 +14,8 @@ from playwright.async_api import Page
 
 from jarvis.field_matcher import MatchedField
 
+_COMBOBOX_OPTION_TIMEOUT_MS = 2000
+
 
 @dataclass
 class FillResult:
@@ -21,6 +23,57 @@ class FillResult:
     label: str
     ok: bool
     detail: str
+
+
+async def fill_combobox(page: Page, element_id: str, value: str) -> FillResult:
+    """Fills a React-Select-style searchable combobox (used by Greenhouse
+    for Country and most Yes/No custom questions) — these render as
+    <input role="combobox">, so a plain .fill() doesn't register as a
+    real selection; the widget needs a click to open, then a click on
+    the matching rendered option.
+    """
+    locator = page.locator(f"#{element_id}")
+    label = ""  # caller fills this in on the returned result if needed
+
+    try:
+        await locator.click()
+        options_locator = page.locator(f'[id^="react-select-{element_id}-option"]')
+        try:
+            await options_locator.first.wait_for(timeout=_COMBOBOX_OPTION_TIMEOUT_MS)
+        except Exception:
+            # No options rendered on click alone — try typing to filter
+            # (needed for long lists like Country).
+            await locator.press_sequentially(value, delay=40)
+            await options_locator.first.wait_for(timeout=_COMBOBOX_OPTION_TIMEOUT_MS)
+
+        option_texts = await options_locator.all_text_contents()
+        match_index = next(
+            (i for i, t in enumerate(option_texts) if t.strip().lower() == value.strip().lower()),
+            None,
+        )
+        if match_index is None:
+            # fall back to a substring match if no exact match exists
+            match_index = next(
+                (i for i, t in enumerate(option_texts) if value.strip().lower() in t.strip().lower()),
+                None,
+            )
+        if match_index is None:
+            return FillResult(element_id, label, False, f"no option matched {value!r}; saw {option_texts}")
+
+        await options_locator.nth(match_index).click()
+
+        # verify by reading the rendered selected text back
+        selected_text = await locator.evaluate(
+            'el => el.closest(".select__control")?.innerText || ""'
+        )
+        if selected_text.strip().lower() == option_texts[match_index].strip().lower():
+            return FillResult(element_id, label, True, f"selected {option_texts[match_index]!r}")
+        return FillResult(
+            element_id, label, False, f"clicked {option_texts[match_index]!r} but selection didn't stick"
+        )
+
+    except Exception as e:
+        return FillResult(element_id, label, False, f"error: {e}")
 
 
 async def fill_matched_fields(page: Page, matched: list[MatchedField]) -> list[FillResult]:
@@ -47,23 +100,14 @@ async def fill_matched_fields(page: Page, matched: list[MatchedField]) -> list[F
                 results.append(FillResult(field.element_id, field.label, True, f"selected {m.value!r}"))
                 continue
 
-            # A React-Select-style searchable combobox (common for Country/
-            # Location on Greenhouse) looks like a text input but a plain
-            # fill() doesn't register as a real selection — the widget needs
-            # actual keystrokes plus clicking a rendered option, and even
-            # then confirming the value stuck requires reading a different
-            # element than the input itself. Not yet handled reliably;
-            # flag it rather than report a false success.
+            # A React-Select-style searchable combobox (Country, and most
+            # Yes/No custom questions on Greenhouse) looks like a text
+            # input but a plain fill() doesn't register as a real
+            # selection — see fill_combobox() for the click+select logic.
             role = await locator.get_attribute("role")
             if role == "combobox":
-                results.append(
-                    FillResult(
-                        field.element_id,
-                        field.label,
-                        False,
-                        "skipped: searchable dropdown widget not yet supported, needs manual review",
-                    )
-                )
+                result = await fill_combobox(page, field.element_id, m.value)
+                results.append(FillResult(field.element_id, field.label, result.ok, result.detail))
                 continue
 
             # plain text input or textarea

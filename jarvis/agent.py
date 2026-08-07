@@ -33,7 +33,7 @@ from playwright.async_api import Page, async_playwright
 from browser_use.llm.litellm.chat import ChatLiteLLM
 
 from jarvis.field_matcher import match_fields
-from jarvis.form_filler import fill_matched_fields
+from jarvis.form_filler import fill_combobox, fill_matched_fields
 from jarvis.form_reader import read_form_fields
 from jarvis.profile import load_profile
 from jarvis.question_answerer import answer_unmatched_fields
@@ -114,7 +114,18 @@ async def run(url: str) -> None:
             status = "OK" if r.ok else "FLAGGED"
             print(f"  [{status}] {r.label!r}: {r.detail}")
 
-        ambiguous = [u for u in unmatched if u.reason == "ambiguous" and u.field.label]
+        # File inputs (e.g. an optional cover-letter upload we have no file
+        # for) are never something the LLM can "answer" with text — a real
+        # run tried exactly this and Playwright correctly rejected it
+        # (file inputs can't be .fill()'d). Report them as skipped instead.
+        file_inputs = [u for u in unmatched if u.reason == "ambiguous" and u.field.input_type == "file"]
+        ambiguous = [
+            u for u in unmatched
+            if u.reason == "ambiguous" and u.field.label and u.field.input_type != "file"
+        ]
+        if file_inputs:
+            print(f"\nSkipped {len(file_inputs)} optional file upload(s) with no matching file "
+                  f"(e.g. cover letter): {[u.field.label for u in file_inputs]}")
         skipped_demographic = [u for u in unmatched if u.reason == "skipped_demographic"]
         if skipped_demographic:
             print(f"\nSkipped {len(skipped_demographic)} demographic/EEO field(s) — "
@@ -133,8 +144,17 @@ async def run(url: str) -> None:
                     continue
                 locator = page.locator(f"#{u.field.element_id}")
                 try:
-                    await locator.fill(answer)
-                    print(f"  [OK] {u.field.label!r}: {answer[:60]!r}")
+                    role = await locator.get_attribute("role")
+                    if role == "combobox":
+                        # Most Yes/No-style custom questions are the same
+                        # React-Select widget as Country — a plain fill()
+                        # doesn't register as a real selection there either.
+                        result = await fill_combobox(page, u.field.element_id, answer)
+                        status = "OK" if result.ok else "FLAGGED"
+                        print(f"  [{status}] {u.field.label!r}: {result.detail}")
+                    else:
+                        await locator.fill(answer)
+                        print(f"  [OK] {u.field.label!r}: {answer[:60]!r}")
                 except Exception as e:
                     print(f"  [FLAGGED] {u.field.label!r}: could not fill — {e}")
 
