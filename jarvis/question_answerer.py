@@ -49,27 +49,54 @@ def _relevant_background(field_label: str, profile: dict) -> dict:
     return background
 
 
-def build_question_prompt(field_label: str, profile: dict, job_context: str = "") -> str:
+def build_question_prompt(
+    field_label: str, profile: dict, job_context: str = "", options: list[str] | None = None
+) -> str:
     background = _relevant_background(field_label, profile)
     background_lines = "\n".join(f"- {k.replace('_', ' ').title()}: {v}" for k, v in background.items())
+
+    options_instruction = ""
+    if options:
+        options_list = ", ".join(repr(o) for o in options)
+        options_instruction = (
+            f"\nThis field is a dropdown with EXACTLY these choices: {options_list}. "
+            f"Your entire response must be one of these choices, verbatim, with nothing else added."
+        )
 
     return f"""{f"Relevant applicant background:\n{background_lines}" if background_lines else "No specific applicant background applies to this field."}
 {f"Job context: {job_context}" if job_context else ""}
 
 Form field label: {field_label!r}
-
+{options_instruction}
 Answer for this field:"""
 
 
 async def answer_field(
-    llm: ChatLiteLLM, field_label: str, profile: dict, job_context: str = ""
+    llm: ChatLiteLLM,
+    field_label: str,
+    profile: dict,
+    job_context: str = "",
+    options: list[str] | None = None,
 ) -> str:
     messages = [
         SystemMessage(content=_SYSTEM_PROMPT),
-        UserMessage(content=build_question_prompt(field_label, profile, job_context)),
+        UserMessage(content=build_question_prompt(field_label, profile, job_context, options)),
     ]
     result = await llm.ainvoke(messages)
-    return result.completion.strip()
+    answer = result.completion.strip()
+
+    if options:
+        # Guard against the model still adding extra words despite the
+        # instruction — snap to the closest matching option rather than
+        # pass through free text that a combobox can't be matched against.
+        exact = next((o for o in options if o.strip().lower() == answer.lower()), None)
+        if exact:
+            return exact
+        starts_with = next((o for o in options if answer.lower().startswith(o.strip().lower())), None)
+        if starts_with:
+            return starts_with
+
+    return answer
 
 
 async def answer_unmatched_fields(
@@ -77,18 +104,26 @@ async def answer_unmatched_fields(
     unmatched: list[UnmatchedField],
     profile: dict,
     job_context: str = "",
+    options_by_id: dict[str, list[str]] | None = None,
 ) -> dict[str, str]:
     """Returns {element_id: answer} for fields worth asking the LLM about.
 
     Skips demographic/EEO fields and CAPTCHA markers entirely — those were
     already filtered by field_matcher and must never reach the LLM.
+
+    options_by_id, when provided, tells the LLM the exact valid choices
+    for combobox-style fields (e.g. ["Yes", "No"]) so it picks one of
+    them directly instead of writing free text that then has to be
+    pattern-matched against the widget's rendered options afterward.
     """
+    options_by_id = options_by_id or {}
     answers: dict[str, str] = {}
     for u in unmatched:
         if u.reason != "ambiguous":
             continue
         if not u.field.label:
             continue
-        answer = await answer_field(llm, u.field.label, profile, job_context)
+        options = options_by_id.get(u.field.element_id)
+        answer = await answer_field(llm, u.field.label, profile, job_context, options)
         answers[u.field.element_id] = answer
     return answers

@@ -33,7 +33,7 @@ from playwright.async_api import Page, async_playwright
 from browser_use.llm.litellm.chat import ChatLiteLLM
 
 from jarvis.field_matcher import match_fields
-from jarvis.form_filler import fill_combobox, fill_matched_fields
+from jarvis.form_filler import fill_combobox, fill_matched_fields, get_combobox_options
 from jarvis.form_reader import read_form_fields
 from jarvis.profile import load_profile
 from jarvis.question_answerer import answer_unmatched_fields
@@ -52,6 +52,10 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 MODEL_NAME = "ollama/qwen3:8b-8k"
 
 _PAGE_LOAD_WAIT_MS = 2500
+# A combobox with more options than this (e.g. a full country list, ~250
+# items) isn't worth asking a small local model to pick from — too many
+# tokens, too much room for a wrong pick. Left for manual review instead.
+_MAX_COMBOBOX_OPTIONS_FOR_LLM = 15
 
 
 async def _click_apply_if_present(page: Page) -> bool:
@@ -132,28 +136,54 @@ async def run(url: str) -> None:
                   "never auto-answered, applicant's own choice.")
 
         if ambiguous:
+            # For combobox-style fields, peek at their actual valid options
+            # BEFORE asking the LLM, so it picks one exactly instead of
+            # writing free text we then have to pattern-match afterward —
+            # a real run showed the LLM writing full sentences ("Yes, I am
+            # open to relocation...") that failed to match the rendered
+            # "Yes"/"No" options at all.
+            combobox_options: dict[str, list[str]] = {}
+            too_many_options: list = []
+            for u in ambiguous:
+                role = await page.locator(f"#{u.field.element_id}").get_attribute("role")
+                if role == "combobox":
+                    options = await get_combobox_options(page, u.field.element_id)
+                    if not options:
+                        continue
+                    if len(options) > _MAX_COMBOBOX_OPTIONS_FOR_LLM:
+                        # A list this long (e.g. all countries) isn't
+                        # something worth asking a small local model to
+                        # pick from correctly — leave it for manual review
+                        # rather than risk a wrong or unmatched guess.
+                        too_many_options.append(u)
+                    else:
+                        combobox_options[u.field.element_id] = options
+
+            ambiguous = [u for u in ambiguous if u not in too_many_options]
+            if too_many_options:
+                print(f"\nSkipped {len(too_many_options)} dropdown(s) with too many options to "
+                      f"reliably auto-select — needs manual review: "
+                      f"{[u.field.label for u in too_many_options]}")
+
             print(f"\nAsking the LLM to answer {len(ambiguous)} ambiguous field(s) "
                   f"(one focused call per field, not the whole page)...")
             llm = ChatLiteLLM(model=MODEL_NAME, api_base=OLLAMA_BASE_URL)
             job_context = await page.title()
-            answers = await answer_unmatched_fields(llm, ambiguous, profile, job_context)
+            answers = await answer_unmatched_fields(
+                llm, ambiguous, profile, job_context, options_by_id=combobox_options
+            )
 
             for u in ambiguous:
                 answer = answers.get(u.field.element_id)
                 if not answer:
                     continue
-                locator = page.locator(f"#{u.field.element_id}")
                 try:
-                    role = await locator.get_attribute("role")
-                    if role == "combobox":
-                        # Most Yes/No-style custom questions are the same
-                        # React-Select widget as Country — a plain fill()
-                        # doesn't register as a real selection there either.
+                    if u.field.element_id in combobox_options:
                         result = await fill_combobox(page, u.field.element_id, answer)
                         status = "OK" if result.ok else "FLAGGED"
                         print(f"  [{status}] {u.field.label!r}: {result.detail}")
                     else:
-                        await locator.fill(answer)
+                        await page.locator(f"#{u.field.element_id}").fill(answer)
                         print(f"  [OK] {u.field.label!r}: {answer[:60]!r}")
                 except Exception as e:
                     print(f"  [FLAGGED] {u.field.label!r}: could not fill — {e}")

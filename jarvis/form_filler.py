@@ -7,6 +7,7 @@ action here is deterministic — the LLM's only role in the pipeline is
 answering the fields field_matcher couldn't resolve (see agent.py).
 """
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,51 @@ class FillResult:
     label: str
     ok: bool
     detail: str
+
+
+async def get_combobox_options(page: Page, element_id: str) -> list[str]:
+    """Opens a combobox just to read its available options, without
+    selecting anything — used to tell the LLM what the valid choices
+    are before it answers, instead of letting it write free text that
+    then has to be pattern-matched against a fixed list after the fact.
+    """
+    locator = page.locator(f"#{element_id}")
+    options_locator = page.locator(f'[id^="react-select-{element_id}-option"]')
+    try:
+        await locator.click()
+        await options_locator.first.wait_for(timeout=_COMBOBOX_OPTION_TIMEOUT_MS)
+        options = await options_locator.all_text_contents()
+    except Exception:
+        options = []
+    finally:
+        await page.keyboard.press("Escape")
+    return [o.strip() for o in options]
+
+
+def _find_matching_option(answer: str, option_texts: list[str]) -> int | None:
+    answer_lower = answer.strip().lower()
+
+    # exact match first
+    for i, t in enumerate(option_texts):
+        if t.strip().lower() == answer_lower:
+            return i
+
+    # the answer often leads with the option word ("Yes, because...") —
+    # check if the answer STARTS WITH an option, not the reverse (a short
+    # option like "Yes" is very likely to be a substring of unrelated text,
+    # but an answer starting with the exact option word is a strong signal)
+    for i, t in enumerate(option_texts):
+        option_lower = t.strip().lower()
+        if answer_lower.startswith(option_lower):
+            return i
+
+    # fall back to the option appearing as a whole word anywhere in the answer
+    for i, t in enumerate(option_texts):
+        option_lower = t.strip().lower()
+        if re.search(rf"\b{re.escape(option_lower)}\b", answer_lower):
+            return i
+
+    return None
 
 
 async def fill_combobox(page: Page, element_id: str, value: str) -> FillResult:
@@ -47,16 +93,7 @@ async def fill_combobox(page: Page, element_id: str, value: str) -> FillResult:
             await options_locator.first.wait_for(timeout=_COMBOBOX_OPTION_TIMEOUT_MS)
 
         option_texts = await options_locator.all_text_contents()
-        match_index = next(
-            (i for i, t in enumerate(option_texts) if t.strip().lower() == value.strip().lower()),
-            None,
-        )
-        if match_index is None:
-            # fall back to a substring match if no exact match exists
-            match_index = next(
-                (i for i, t in enumerate(option_texts) if value.strip().lower() in t.strip().lower()),
-                None,
-            )
+        match_index = _find_matching_option(value, option_texts)
         if match_index is None:
             return FillResult(element_id, label, False, f"no option matched {value!r}; saw {option_texts}")
 

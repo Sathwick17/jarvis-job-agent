@@ -25,7 +25,15 @@ _PROFILE_KEY_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("full_name", re.compile(r"^\s*(full\s*)?name\s*$", re.IGNORECASE)),
     ("email", re.compile(r"\bemail\b", re.IGNORECASE)),
     ("phone", re.compile(r"\bphone\b", re.IGNORECASE)),
-    ("location", re.compile(r"^\s*(country|location|address)\s*$", re.IGNORECASE)),
+    # NOTE: deliberately NOT matching a bare "Country" label to location.
+    # On at least one real Greenhouse form, the "Country" field is actually
+    # a phone-country-code picker (its dropdown options were "United States
+    # +1", "Afghanistan +93", ...) sitting next to the Phone field — not a
+    # country-of-residence field. A full address is the wrong answer for
+    # that widget, and there's no reliable way to tell which meaning a
+    # given form intends from the label alone. Left unmatched on purpose;
+    # a human should pick the right option manually.
+    ("location", re.compile(r"^\s*(location|address)\s*$", re.IGNORECASE)),
     ("linkedin_url", re.compile(r"\blinkedin\b", re.IGNORECASE)),
     ("github_url", re.compile(r"\bgithub\b", re.IGNORECASE)),
     ("portfolio_url", re.compile(r"\b(portfolio|website|publications)\b", re.IGNORECASE)),
