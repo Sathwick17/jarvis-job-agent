@@ -9,5 +9,11 @@
   "resume_path": "config/resume.pdf",
   "cover_letter_template": "I'm excited about {company}'s work on {role_context} and believe my background in {relevant_skill} makes me a strong fit for the {role} role.",
   "work_authorization": "Authorized to work in the US without sponsorship",
-  "years_of_experience": 3
+  "years_of_experience": 3,
+  "_comment_eeo_fields": "The 5 fields below are optional EEO/demographic self-identification (Gender, Hispanic/Latino, Race, Veteran Status, Disability). Jarvis will NEVER auto-fill these unless every one of them is present here — leave them out entirely (or delete this block) if you'd rather answer these yourself on each application, which is the default and recommended choice.",
+  "gender": "",
+  "hispanic_or_latino": "",
+  "race_ethnicity": "",
+  "veteran_status": "",
+  "disability_status": ""
 }

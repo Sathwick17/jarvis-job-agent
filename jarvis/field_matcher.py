@@ -44,12 +44,19 @@ _PROFILE_KEY_PATTERNS: list[tuple[str, re.Pattern]] = [
 # question containing the word "country".
 _MAX_LABEL_WORDS_FOR_KEYWORD_MATCH = 4
 
-# Fields no applicant profile should auto-answer — EEO/demographic
-# self-identification questions are legally meant to be the applicant's own
-# choice, and Greenhouse always marks these optional. Never guess these.
-_SKIP_PATTERNS = re.compile(
-    r"\b(gender|hispanic|latino|ethnicity|veteran|disability)\b", re.IGNORECASE
-)
+# EEO/demographic self-identification questions are legally meant to be
+# the applicant's own voluntary choice — Jarvis only auto-fills these if
+# the user has explicitly opted in by providing ALL FIVE in their profile
+# (see profile.example.json). If even one is missing, none are answered;
+# a partial opt-in reads as "user didn't actually mean to set this up."
+_EEO_KEY_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("gender", re.compile(r"\bgender\b", re.IGNORECASE)),
+    ("hispanic_or_latino", re.compile(r"\bhispanic\b|\blatino\b", re.IGNORECASE)),
+    ("race_ethnicity", re.compile(r"\brace\b|\bethnicity\b", re.IGNORECASE)),
+    ("veteran_status", re.compile(r"\bveteran\b", re.IGNORECASE)),
+    ("disability_status", re.compile(r"\bdisability\b", re.IGNORECASE)),
+]
+_EEO_PROFILE_KEYS = [key for key, _ in _EEO_KEY_PATTERNS]
 
 # Signals this isn't a fillable field at all.
 _NON_FIELD_IDS = re.compile(r"recaptcha|captcha", re.IGNORECASE)
@@ -74,13 +81,21 @@ def match_fields(
     matched: list[MatchedField] = []
     unmatched: list[UnmatchedField] = []
 
+    # Opt-in is all-or-nothing: only treat EEO fields as answerable if
+    # every one of the five is present in the profile.
+    eeo_opted_in = all(profile.get(key) for key in _EEO_PROFILE_KEYS)
+
     for field in fields:
         if _NON_FIELD_IDS.search(field.element_id):
             unmatched.append(UnmatchedField(field, "captcha"))
             continue
 
-        if _SKIP_PATTERNS.search(field.label) or _SKIP_PATTERNS.search(field.element_id):
-            unmatched.append(UnmatchedField(field, "skipped_demographic"))
+        eeo_key = _match_eeo_field(field)
+        if eeo_key:
+            if eeo_opted_in:
+                matched.append(MatchedField(field, eeo_key, str(profile[eeo_key])))
+            else:
+                unmatched.append(UnmatchedField(field, "skipped_demographic"))
             continue
 
         # File inputs: match by element id, not label — Greenhouse labels
@@ -100,6 +115,14 @@ def match_fields(
             unmatched.append(UnmatchedField(field, "ambiguous"))
 
     return matched, unmatched
+
+
+def _match_eeo_field(field: FormField) -> str | None:
+    haystack = f"{field.label} {field.element_id}"
+    for profile_key, pattern in _EEO_KEY_PATTERNS:
+        if pattern.search(haystack):
+            return profile_key
+    return None
 
 
 def _match_one(field: FormField) -> str | None:
