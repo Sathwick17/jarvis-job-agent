@@ -1,5 +1,5 @@
 """
-Part 2: Jarvis's form-filling pipeline.
+Part 2/3: Jarvis's form-filling pipeline and approval-gate contract.
 
 Deterministic-first: reads the real form fields via Playwright, fills
 whatever matches the applicant's profile in code (no LLM), and only
@@ -10,13 +10,20 @@ approach was slow (3+ min/step locally), and in testing hallucinated
 fake URLs, got stuck in scroll loops, and once clicked a real "Submit
 application" button despite explicit instructions not to.
 
-Jarvis never submits: this pipeline has no code path that clicks
-anything after fields are filled — it stops and waits for a human to
-review and submit manually. That's a stronger guarantee than a runtime
-check (see jarvis/safe_tools.py, still used by the older LLM-loop
-approach) because there's simply no click-executing code left to guard.
-The only click this pipeline ever performs is "Apply" on a listing
-page, before any filling happens.
+Jarvis never submits: fill_application() has no code path that clicks
+anything after fields are filled — it always ends by returning an
+ApplyResult (see jarvis/apply_result.py) and leaving the browser open
+for a human (or, later, a dashboard) to review and submit manually.
+That's a stronger guarantee than a runtime check (see jarvis/safe_tools.py,
+still used by the older LLM-loop approach) because there's simply no
+click-executing code left to guard. The only click this pipeline ever
+performs is "Apply" on a listing page, before any filling happens.
+
+fill_application() does the work and returns a result; it does not
+manage the browser's lifecycle or print anything — that's the caller's
+job (see main() below for the CLI version, or a future n8n/dashboard
+caller). This split is what makes the approval gate a real contract
+instead of something baked into a terminal script.
 
 Uses Qwen, served locally by Ollama — no API keys, no cloud calls.
 
@@ -28,10 +35,11 @@ import asyncio
 import sys
 from pathlib import Path
 
-from playwright.async_api import Page, async_playwright
+from playwright.async_api import Browser, Page, async_playwright
 
 from browser_use.llm.litellm.chat import ChatLiteLLM
 
+from jarvis.apply_result import ApplyResult, ApplyStatus, FieldOutcome
 from jarvis.field_matcher import match_fields
 from jarvis.form_filler import fill_combobox, fill_matched_fields, get_combobox_options
 from jarvis.form_reader import read_form_fields
@@ -74,146 +82,195 @@ async def _click_apply_if_present(page: Page) -> bool:
     return True
 
 
-async def run(url: str) -> None:
+async def fill_application(page: Page, url: str) -> ApplyResult:
+    """Fills out a job application form on an already-open page.
+
+    Does the work and returns a structured result — never prints,
+    never blocks on input, never closes the page. The browser's
+    lifecycle (open/close) and any human-facing presentation are the
+    caller's responsibility; see main() for the CLI version.
+    """
     profile = load_profile()
+    fields_filled: list[FieldOutcome] = []
+    fields_skipped: list[FieldOutcome] = []
 
     resume_path = Path(profile.get("resume_path", ""))
-    if profile.get("resume_path") and not resume_path.exists():
-        print(f"Warning: resume_path '{resume_path}' does not exist — file upload fields will be skipped.")
+    resume_missing = bool(profile.get("resume_path")) and not resume_path.exists()
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        page = await browser.new_page()
+    await page.goto(url, timeout=30000)
+    await page.wait_for_timeout(_PAGE_LOAD_WAIT_MS)
 
-        print(f"Navigating to {url} ...")
-        await page.goto(url, timeout=30000)
-        await page.wait_for_timeout(_PAGE_LOAD_WAIT_MS)
-
-        fields = await read_form_fields(page)
+    fields = await read_form_fields(page)
+    if len(fields) < 3:
+        clicked = await _click_apply_if_present(page)
+        if clicked:
+            fields = await read_form_fields(page)
         if len(fields) < 3:
-            # Likely a job listing page, not the application form itself.
-            print("Few/no form fields found — looking for an Apply link...")
-            clicked = await _click_apply_if_present(page)
-            if clicked:
-                fields = await read_form_fields(page)
-            if len(fields) < 3:
-                print(f"Still only found {len(fields)} field(s). Stopping — "
-                      "this may not be a direct application form URL.")
-                await browser.close()
-                return
-
-        print(f"Found {len(fields)} form fields.")
-
-        matched, unmatched = match_fields(fields, profile)
-        captcha_fields = [u for u in unmatched if u.reason == "captcha"]
-        if captcha_fields:
-            print("\nCAPTCHA detected on this form. Stopping — Jarvis does not "
-                  "attempt to solve or bypass CAPTCHAs by design.")
-            await browser.close()
-            return
-
-        print(f"\nDeterministically matched {len(matched)} fields (no LLM):")
-        fill_results = await fill_matched_fields(page, matched)
-        for r in fill_results:
-            status = "OK" if r.ok else "FLAGGED"
-            print(f"  [{status}] {r.label!r}: {r.detail}")
-
-        # Greenhouse (and likely other ATSs) conditionally reveal new
-        # fields after a combobox is answered — e.g. "Please identify
-        # your race" only appears in the DOM once "Are you Hispanic/
-        # Latino?" has been answered. A real run confirmed this: race
-        # was simply absent at the initial read, not a matching failure.
-        # Re-scan once for anything that appeared as a side effect of
-        # filling and fold it into the same matched/unmatched flow.
-        known_ids = {f.element_id for f in fields}
-        fields_after_fill = await read_form_fields(page)
-        newly_revealed = [f for f in fields_after_fill if f.element_id not in known_ids]
-        if newly_revealed:
-            print(f"\n{len(newly_revealed)} new field(s) appeared after filling "
-                  f"(conditionally revealed): {[f.label for f in newly_revealed]}")
-            new_matched, new_unmatched = match_fields(newly_revealed, profile)
-            if new_matched:
-                new_fill_results = await fill_matched_fields(page, new_matched)
-                for r in new_fill_results:
-                    status = "OK" if r.ok else "FLAGGED"
-                    print(f"  [{status}] {r.label!r}: {r.detail}")
-            matched += new_matched
-            unmatched += new_unmatched
-
-        # File inputs (e.g. an optional cover-letter upload we have no file
-        # for) are never something the LLM can "answer" with text — a real
-        # run tried exactly this and Playwright correctly rejected it
-        # (file inputs can't be .fill()'d). Report them as skipped instead.
-        file_inputs = [u for u in unmatched if u.reason == "ambiguous" and u.field.input_type == "file"]
-        ambiguous = [
-            u for u in unmatched
-            if u.reason == "ambiguous" and u.field.label and u.field.input_type != "file"
-        ]
-        if file_inputs:
-            print(f"\nSkipped {len(file_inputs)} optional file upload(s) with no matching file "
-                  f"(e.g. cover letter): {[u.field.label for u in file_inputs]}")
-        skipped_demographic = [u for u in unmatched if u.reason == "skipped_demographic"]
-        if skipped_demographic:
-            print(f"\nSkipped {len(skipped_demographic)} demographic/EEO field(s) — "
-                  "never auto-answered, applicant's own choice.")
-
-        if ambiguous:
-            # For combobox-style fields, peek at their actual valid options
-            # BEFORE asking the LLM, so it picks one exactly instead of
-            # writing free text we then have to pattern-match afterward —
-            # a real run showed the LLM writing full sentences ("Yes, I am
-            # open to relocation...") that failed to match the rendered
-            # "Yes"/"No" options at all.
-            combobox_options: dict[str, list[str]] = {}
-            too_many_options: list = []
-            for u in ambiguous:
-                role = await page.locator(f"#{u.field.element_id}").get_attribute("role")
-                if role == "combobox":
-                    options = await get_combobox_options(page, u.field.element_id)
-                    if not options:
-                        continue
-                    if len(options) > _MAX_COMBOBOX_OPTIONS_FOR_LLM:
-                        # A list this long (e.g. all countries) isn't
-                        # something worth asking a small local model to
-                        # pick from correctly — leave it for manual review
-                        # rather than risk a wrong or unmatched guess.
-                        too_many_options.append(u)
-                    else:
-                        combobox_options[u.field.element_id] = options
-
-            ambiguous = [u for u in ambiguous if u not in too_many_options]
-            if too_many_options:
-                print(f"\nSkipped {len(too_many_options)} dropdown(s) with too many options to "
-                      f"reliably auto-select — needs manual review: "
-                      f"{[u.field.label for u in too_many_options]}")
-
-            print(f"\nAsking the LLM to answer {len(ambiguous)} ambiguous field(s) "
-                  f"(one focused call per field, not the whole page)...")
-            llm = ChatLiteLLM(model=MODEL_NAME, api_base=OLLAMA_BASE_URL)
-            job_context = await page.title()
-            answers = await answer_unmatched_fields(
-                llm, ambiguous, profile, job_context, options_by_id=combobox_options
+            return ApplyResult(
+                status=ApplyStatus.FLAGGED,
+                url=url,
+                reason=f"Only found {len(fields)} field(s) — this may not be a direct "
+                       "application form URL.",
             )
 
-            for u in ambiguous:
-                answer = answers.get(u.field.element_id)
-                if not answer:
-                    continue
-                try:
-                    if u.field.element_id in combobox_options:
-                        result = await fill_combobox(page, u.field.element_id, answer)
-                        status = "OK" if result.ok else "FLAGGED"
-                        print(f"  [{status}] {u.field.label!r}: {result.detail}")
-                    else:
-                        await page.locator(f"#{u.field.element_id}").fill(answer)
-                        print(f"  [OK] {u.field.label!r}: {answer[:60]!r}")
-                except Exception as e:
-                    print(f"  [FLAGGED] {u.field.label!r}: could not fill — {e}")
+    matched, unmatched = match_fields(fields, profile)
+    if any(u.reason == "captcha" for u in unmatched):
+        return ApplyResult(
+            status=ApplyStatus.FLAGGED,
+            url=url,
+            reason="CAPTCHA detected on this form. Jarvis does not attempt to "
+                   "solve or bypass CAPTCHAs by design.",
+        )
 
-        print("\n--- Form filling complete. Ready for human review. ---")
-        print("Jarvis will NOT click Submit/Apply — review the browser window and submit yourself.")
-        input("\nPress Enter to close the browser...")
-        await browser.close()
+    fill_results = await fill_matched_fields(page, matched)
+    for r in fill_results:
+        fields_filled.append(FieldOutcome(r.element_id, r.label, r.ok, r.detail, source="matched"))
+
+    # Greenhouse (and likely other ATSs) conditionally reveal new fields
+    # after a combobox is answered — e.g. "Please identify your race"
+    # only appears once "Are you Hispanic/Latino?" has been answered.
+    # Re-scan once for anything that appeared as a side effect of
+    # filling and fold it into the same matched/unmatched flow.
+    known_ids = {f.element_id for f in fields}
+    fields_after_fill = await read_form_fields(page)
+    newly_revealed = [f for f in fields_after_fill if f.element_id not in known_ids]
+    if newly_revealed:
+        new_matched, new_unmatched = match_fields(newly_revealed, profile)
+        if new_matched:
+            new_fill_results = await fill_matched_fields(page, new_matched)
+            for r in new_fill_results:
+                fields_filled.append(FieldOutcome(r.element_id, r.label, r.ok, r.detail, source="matched"))
+        unmatched += new_unmatched
+
+    # File inputs (e.g. an optional cover-letter upload we have no file
+    # for) are never something the LLM can "answer" with text.
+    file_inputs = [u for u in unmatched if u.reason == "ambiguous" and u.field.input_type == "file"]
+    for u in file_inputs:
+        fields_skipped.append(
+            FieldOutcome(u.field.element_id, u.field.label, False, "no matching file to attach", source="skipped")
+        )
+
+    for u in unmatched:
+        if u.reason == "skipped_demographic":
+            fields_skipped.append(
+                FieldOutcome(
+                    u.field.element_id, u.field.label, False,
+                    "never auto-answered without full EEO opt-in", source="skipped",
+                )
+            )
+
+    ambiguous = [
+        u for u in unmatched
+        if u.reason == "ambiguous" and u.field.label and u.field.input_type != "file"
+    ]
+
+    if ambiguous:
+        # For combobox-style fields, peek at their actual valid options
+        # BEFORE asking the LLM, so it picks one exactly instead of
+        # writing free text that then has to be pattern-matched after
+        # the fact — a real run showed the LLM writing full sentences
+        # that failed to match rendered "Yes"/"No" options at all.
+        combobox_options: dict[str, list[str]] = {}
+        too_many_options = []
+        for u in ambiguous:
+            role = await page.locator(f"#{u.field.element_id}").get_attribute("role")
+            if role == "combobox":
+                options = await get_combobox_options(page, u.field.element_id)
+                if not options:
+                    continue
+                if len(options) > _MAX_COMBOBOX_OPTIONS_FOR_LLM:
+                    too_many_options.append(u)
+                else:
+                    combobox_options[u.field.element_id] = options
+
+        for u in too_many_options:
+            fields_skipped.append(
+                FieldOutcome(
+                    u.field.element_id, u.field.label, False,
+                    "too many dropdown options to reliably auto-select", source="skipped",
+                )
+            )
+        ambiguous = [u for u in ambiguous if u not in too_many_options]
+
+        llm = ChatLiteLLM(model=MODEL_NAME, api_base=OLLAMA_BASE_URL)
+        job_context = await page.title()
+        answers = await answer_unmatched_fields(
+            llm, ambiguous, profile, job_context, options_by_id=combobox_options
+        )
+
+        for u in ambiguous:
+            answer = answers.get(u.field.element_id)
+            if not answer:
+                continue
+            try:
+                if u.field.element_id in combobox_options:
+                    result = await fill_combobox(page, u.field.element_id, answer)
+                    fields_filled.append(
+                        FieldOutcome(u.field.element_id, u.field.label, result.ok, result.detail, source="llm")
+                    )
+                else:
+                    await page.locator(f"#{u.field.element_id}").fill(answer)
+                    fields_filled.append(
+                        FieldOutcome(u.field.element_id, u.field.label, True, answer[:80], source="llm")
+                    )
+            except Exception as e:
+                fields_filled.append(
+                    FieldOutcome(u.field.element_id, u.field.label, False, f"could not fill: {e}", source="llm")
+                )
+
+    reason = ""
+    if resume_missing:
+        reason = f"Warning: resume_path '{resume_path}' does not exist — file upload fields were skipped."
+
+    return ApplyResult(
+        status=ApplyStatus.READY_FOR_REVIEW,
+        url=url,
+        reason=reason,
+        fields_filled=fields_filled,
+        fields_skipped=fields_skipped,
+    )
+
+
+def _print_result(result: ApplyResult) -> None:
+    if result.status != ApplyStatus.READY_FOR_REVIEW:
+        print(f"\n{result.status.value.upper()}: {result.reason}")
+        return
+
+    if result.reason:
+        print(result.reason)
+
+    print(f"\n{result.ok_count} field(s) filled successfully:")
+    for f in result.fields_filled:
+        status = "OK" if f.ok else "FLAGGED"
+        print(f"  [{status}] {f.label!r} ({f.source}): {f.detail}")
+
+    if result.fields_skipped:
+        print(f"\n{len(result.fields_skipped)} field(s) skipped, needs manual review:")
+        for f in result.fields_skipped:
+            print(f"  [SKIPPED] {f.label!r}: {f.detail}")
+
+    print("\n--- Form filling complete. Ready for human review. ---")
+    print("Jarvis will NOT click Submit/Apply — review the browser window and submit yourself.")
+
+
+async def run(url: str) -> None:
+    """CLI entry point: opens a browser, fills the form, prints the
+    result, waits for the human to review, then closes. This is one
+    possible caller of fill_application() — n8n or a dashboard would
+    call it differently (no input(), likely no headed browser)."""
+    browser: Browser | None = None
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch(headless=False)
+            page = await browser.new_page()
+            result = await fill_application(page, url)
+            _print_result(result)
+
+            if result.status == ApplyStatus.READY_FOR_REVIEW:
+                input("\nPress Enter to close the browser...")
+        finally:
+            if browser is not None:
+                await browser.close()
 
 
 def main() -> None:
