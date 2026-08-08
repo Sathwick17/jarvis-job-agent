@@ -7,6 +7,8 @@ entire chat
 # Personal applicant data — never committed, each user supplies their own
 config/profile.json
 config/*.pdf
+data/openings.csv
+data/applications.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -1,0 +1,173 @@
+{
+  "name": "Jarvis - Apply to Openings",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-1120, 300]
+    },
+    {
+      "parameters": {
+        "fileSelector": "/home/node/data/openings.csv",
+        "options": {}
+      },
+      "id": "read-csv",
+      "name": "Read Openings CSV",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [-900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "fromCsv",
+        "options": {}
+      },
+      "id": "parse-csv",
+      "name": "Parse CSV",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [-680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "status-is-pending",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "pending",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "filter-pending",
+      "name": "Only Pending",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [-460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8420/apply",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"url\": $json.url } }}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "call-jarvis",
+      "name": "Call Jarvis /apply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-240, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "is-ready",
+              "leftValue": "={{ $json.result.status }}",
+              "rightValue": "ready_for_review",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "branch-status",
+      "name": "Ready for Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-20, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "log-ready",
+              "name": "message",
+              "type": "string",
+              "value": "=Ready for review: {{ $json.result.ok_count }} fields filled, {{ $json.result.needs_attention_count }} need attention. Session: {{ $json.session_id }}. Open the browser window to review and submit manually."
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "log-ready-for-review",
+      "name": "Ready For Review",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [200, 200]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "log-flagged",
+              "name": "message",
+              "type": "string",
+              "value": "=Flagged, not filled: {{ $json.result.reason }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "log-flagged",
+      "name": "Flagged",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [200, 420]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{ "node": "Read Openings CSV", "type": "main", "index": 0 }]]
+    },
+    "Read Openings CSV": {
+      "main": [[{ "node": "Parse CSV", "type": "main", "index": 0 }]]
+    },
+    "Parse CSV": {
+      "main": [[{ "node": "Only Pending", "type": "main", "index": 0 }]]
+    },
+    "Only Pending": {
+      "main": [[{ "node": "Call Jarvis /apply", "type": "main", "index": 0 }]]
+    },
+    "Call Jarvis /apply": {
+      "main": [[{ "node": "Ready for Review?", "type": "main", "index": 0 }]]
+    },
+    "Ready for Review?": {
+      "main": [
+        [{ "node": "Ready For Review", "type": "main", "index": 0 }],
+        [{ "node": "Flagged", "type": "main", "index": 0 }]
+      ]
+    }
+  }
+}
