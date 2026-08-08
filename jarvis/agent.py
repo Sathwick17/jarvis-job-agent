@@ -32,6 +32,7 @@ Usage:
 """
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -46,7 +47,11 @@ from jarvis.form_reader import read_form_fields
 from jarvis.profile import load_profile
 from jarvis.question_answerer import answer_unmatched_fields
 
-OLLAMA_BASE_URL = "http://localhost:11434"
+# Configurable since Ollama's default port (11434) can collide with other
+# local services — e.g. this machine also runs a separate Dockerized
+# Ollama for an unrelated project on that same port. Override with
+# OLLAMA_BASE_URL if 11434 isn't free on your machine.
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 # qwen2.5:3b is faster but unreliable — it hallucinated an unrelated task
 # (tried to print the page as a PDF) instead of following instructions.
 # qwen3:8b's default 4096-token context was too small (truncation likely
